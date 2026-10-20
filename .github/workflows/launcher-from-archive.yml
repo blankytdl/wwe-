@@ -1,0 +1,95 @@
+# Builds ONLY the Windows launcher (wwe13-launcher.exe): AVX1 CPU check + 1080p option.
+# No game files, no codegen and no game build are needed. The launcher just needs the ReXGlue SDK's
+# source tree (SDL3, Dear ImGui, volk, Vulkan headers, the SDK's Windows toolchain file), which this
+# workflow fetches and patches but does not compile.
+name: Launcher from archive
+
+# Upload just two things to the repo: this file (as .github/workflows/launcher-from-archive.yml) and
+# the project archive named wwe13-source.zip (or .rar / .7z). The workflow unpacks it and builds.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_BIN: /usr/lib/llvm-20/bin
+  XWIN_DIR: ${{ github.workspace }}/xwin
+  BASE_COMMIT: 987593c0fc6612850a2e1b247b2b03aa5281e663
+  SDK_URL: https://github.com/HollywoodAkeem/rexglue-sdk-yukes.git
+
+jobs:
+  launcher-windows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project archive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full p7zip-rar
+          archive=$(ls wwe13-source.* 2>/dev/null | head -1)
+          [ -n "$archive" ] || { echo "::error::Upload wwe13-source.zip (or .rar/.7z) to the repo root"; exit 1; }
+          mkdir -p /tmp/unpacked wwe13
+          7z x -y -o/tmp/unpacked "$archive" >/dev/null
+          # The project folder is the one that contains launcher2/ (it may be nested one level down).
+          src=$(dirname "$(find /tmp/unpacked -type d -name launcher2 | head -1)")
+          [ -d "$src/launcher2" ] || { echo "::error::launcher2/ not found inside the archive"; exit 1; }
+          mv "$src" wwe13/wwe13-recomp
+          ls wwe13/wwe13-recomp
+
+      - name: Install LLVM 20 and build tools
+        run: |
+          wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh 20
+          sudo apt-get install -y llvm-20 clang-20 lld-20 cmake ninja-build git python3
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+
+      - name: Cache Windows SDK files (xwin)
+        id: xwin-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.XWIN_DIR }}
+          key: xwin-0.10.0-v1
+
+      - name: Install xwin and Windows SDK/CRT
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install xwin --version 0.10.0 --locked
+          xwin --accept-license --arch x86_64 --cache-dir "$HOME/.cache/xwin" download
+          xwin --accept-license --arch x86_64 --cache-dir "$HOME/.cache/xwin" unpack
+          xwin --accept-license --arch x86_64 --cache-dir "$HOME/.cache/xwin" splat --output "$XWIN_DIR"
+
+      # Same SDK the game uses: pinned commit + this project's patches (they add the Windows toolchain
+      # file and the thirdparty/decoders the launcher includes). Only the folders the launcher builds
+      # against are checked out; the SDK itself is never compiled.
+      - name: Fetch and patch the ReXGlue SDK sources
+        run: |
+          cd wwe13
+          mkdir -p tools
+          git clone --no-checkout "$SDK_URL" tools/rexglue
+          git -C tools/rexglue checkout -q -b wwe13-fixes "$BASE_COMMIT"
+          git -C tools/rexglue -c user.name=ci -c user.email=ci@example.invalid \
+            am -q --keep-cr "$GITHUB_WORKSPACE"/wwe13/wwe13-recomp/rexglue-patches/*.patch
+          git -C tools/rexglue submodule update --init --recursive --depth 1 -- \
+            thirdparty/sdl3 thirdparty/imgui thirdparty/volk thirdparty/vulkan-headers \
+            || git -C tools/rexglue submodule update --init --recursive
+          ls tools/rexglue/thirdparty
+
+      # The launcher has to run on the AVX1 CPU it reports on, so it is built for Ivy Bridge too.
+      - name: Build wwe13-launcher.exe
+        working-directory: wwe13/wwe13-recomp
+        run: |
+          cmake -S launcher2 -B out/launcher2-win -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/../tools/rexglue/cmake/toolchains/win-amd64-xwin.cmake" \
+            -DXWIN_DIR="$XWIN_DIR" -DLLVM_BIN="$LLVM_BIN" \
+            -DXWIN_CPU_FLAGS="-march=ivybridge -mtune=ivybridge"
+          cmake --build out/launcher2-win --parallel
+          ls -l out/launcher2-win/wwe13-launcher.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wwe13-launcher-windows-avx1
+          path: wwe13/wwe13-recomp/out/launcher2-win/wwe13-launcher.exe
+          retention-days: 30
