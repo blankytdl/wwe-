@@ -1,50 +1,74 @@
-# Builds ONLY the Windows launcher (wwe13-launcher.exe): AVX1 CPU check + 1080p option.
-# No game files, no codegen and no game build are needed. The launcher just needs the ReXGlue SDK's
-# source tree (SDL3, Dear ImGui, volk, Vulkan headers, the SDK's Windows toolchain file), which this
-# workflow fetches and patches but does not compile.
-name: Launcher from archive
+# Builds WWE '13 Recomp (AVX1 / Ivy Bridge baseline) for Windows x64, cross-compiled on Linux.
+#
+# The game files must NOT be in a public repository. Codegen needs your own default.xex + default.xexp
+# (WWE '13 title update 2.0.1.0), so the workflow downloads them from a private location you control.
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   (either put default.zip in the repo root of a PRIVATE repo, or set these)
+#   GAME_FILES_URL          Direct URL of a .zip holding default.xex and default.xexp.
+#   GAME_FILES_AUTH_HEADER  optional. Full header line, e.g. "Authorization: Bearer <token>".
+#
+# Use a PRIVATE repository: the built wwe13.exe contains code recompiled from the game.
+name: Build
 
-# Upload just two things to the repo: this file (as .github/workflows/launcher-from-archive.yml) and
-# the project archive named wwe13-source.zip (or .rar / .7z). The workflow unpacks it and builds.
 on:
   workflow_dispatch:
+    inputs:
+      build_linux:
+        description: Also build the Linux game
+        type: boolean
+        default: false
+      skip_hash_check:
+        description: Do not compare default.xex/.xexp with the known TU 2.0.1.0 SHA-256 values
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   LLVM_BIN: /usr/lib/llvm-20/bin
   XWIN_DIR: ${{ github.workspace }}/xwin
-  BASE_COMMIT: 987593c0fc6612850a2e1b247b2b03aa5281e663
-  SDK_URL: https://github.com/HollywoodAkeem/rexglue-sdk-yukes.git
+  CPU_FLAGS: -march=ivybridge -mtune=ivybridge
+  XEX_SHA256: c4b35f3328e3612376cf9d16d26282c164e9b79842debbaca3ef06a373fefced
+  XEXP_SHA256: 41dac3acff682e88a15b982d0595170b808e70f4c05b004c2312edee191ad037
 
 jobs:
-  launcher-windows:
+  windows:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 360
     steps:
+      # The project expects the SDK at ../tools/rexglue, so check out one level down.
       - uses: actions/checkout@v4
+        with:
+          path: wwe13/wwe13-recomp
 
-      - name: Unpack the project archive
+      - name: Free disk space
         run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full p7zip-rar
-          archive=$(ls wwe13-source.* 2>/dev/null | head -1)
-          [ -n "$archive" ] || { echo "::error::Upload wwe13-source.zip (or .rar/.7z) to the repo root"; exit 1; }
-          mkdir -p /tmp/unpacked wwe13
-          7z x -y -o/tmp/unpacked "$archive" >/dev/null
-          # The project folder is the one that contains launcher2/ (it may be nested one level down).
-          src=$(dirname "$(find /tmp/unpacked -type d -name launcher2 | head -1)")
-          [ -d "$src/launcher2" ] || { echo "::error::launcher2/ not found inside the archive"; exit 1; }
-          mv "$src" wwe13/wwe13-recomp
-          ls wwe13/wwe13-recomp
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift
+          sudo apt-get clean
+          df -h /
 
       - name: Install LLVM 20 and build tools
         run: |
           wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash /tmp/llvm.sh 20
-          sudo apt-get install -y llvm-20 clang-20 lld-20 cmake ninja-build git python3
+          sudo apt-get install -y llvm-20 clang-20 lld-20 cmake ninja-build build-essential git curl \
+            unzip autoconf python3-venv libgtk-3-dev libx11-xcb-dev wine
           echo "$LLVM_BIN" >> "$GITHUB_PATH"
+
+      - name: Install Vulkan SDK
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
+            http://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
 
       - name: Cache Windows SDK files (xwin)
         id: xwin-cache
@@ -61,35 +85,105 @@ jobs:
           xwin --accept-license --arch x86_64 --cache-dir "$HOME/.cache/xwin" unpack
           xwin --accept-license --arch x86_64 --cache-dir "$HOME/.cache/xwin" splat --output "$XWIN_DIR"
 
-      # Same SDK the game uses: pinned commit + this project's patches (they add the Windows toolchain
-      # file and the thirdparty/decoders the launcher includes). Only the folders the launcher builds
-      # against are checked out; the SDK itself is never compiled.
-      - name: Fetch and patch the ReXGlue SDK sources
-        run: |
-          cd wwe13
-          mkdir -p tools
-          git clone --no-checkout "$SDK_URL" tools/rexglue
-          git -C tools/rexglue checkout -q -b wwe13-fixes "$BASE_COMMIT"
-          git -C tools/rexglue -c user.name=ci -c user.email=ci@example.invalid \
-            am -q --keep-cr "$GITHUB_WORKSPACE"/wwe13/wwe13-recomp/rexglue-patches/*.patch
-          git -C tools/rexglue submodule update --init --recursive --depth 1 -- \
-            thirdparty/sdl3 thirdparty/imgui thirdparty/volk thirdparty/vulkan-headers \
-            || git -C tools/rexglue submodule update --init --recursive
-          ls tools/rexglue/thirdparty
+      # Whole SDK checkout + builds. Saved only after a green run; the key changes with the SDK patches
+      # and the build scripts, which is what decides the compiler flags (-march=ivybridge).
+      - name: Cache ReXGlue SDK
+        uses: actions/cache@v4
+        with:
+          path: wwe13/tools/rexglue
+          key: rexglue-ivybridge-${{ hashFiles('wwe13/wwe13-recomp/rexglue-patches/*.patch', 'wwe13/wwe13-recomp/tools/setup.sh', 'wwe13/wwe13-recomp/tools/build-windows.sh') }}
 
-      # The launcher has to run on the AVX1 CPU it reports on, so it is built for Ivy Bridge too.
-      - name: Build wwe13-launcher.exe
+      - name: Fetch your game files
+        working-directory: wwe13/wwe13-recomp
+        env:
+          GAME_FILES_URL: ${{ secrets.GAME_FILES_URL }}
+          GAME_FILES_AUTH_HEADER: ${{ secrets.GAME_FILES_AUTH_HEADER }}
+        run: |
+          # Option A (simplest): put default.zip in the root of this PRIVATE repo.
+          # Option B: GAME_FILES_URL secret pointing at a private download link.
+          if [ -f default.zip ]; then
+            cp default.zip /tmp/game-files.zip
+          elif [ -n "$GAME_FILES_URL" ]; then
+            echo "::add-mask::$GAME_FILES_URL"
+            args=(-fsSL --retry 3 -o /tmp/game-files.zip)
+            [ -n "$GAME_FILES_AUTH_HEADER" ] && args+=(-H "$GAME_FILES_AUTH_HEADER")
+            curl "${args[@]}" "$GAME_FILES_URL"
+          else
+            echo "::error::Add default.zip (with default.xex and default.xexp) to the repo root, or set the GAME_FILES_URL secret."
+            exit 1
+          fi
+          mkdir -p game
+          unzip -j -o /tmp/game-files.zip '*default.xex' '*default.xexp' -d game
+          rm -f /tmp/game-files.zip
+          ls -l game
+          if [ "${{ inputs.skip_hash_check }}" != "true" ]; then
+            echo "$XEX_SHA256  game/default.xex"   >  /tmp/game.sha256
+            echo "$XEXP_SHA256  game/default.xexp" >> /tmp/game.sha256
+            sha256sum -c /tmp/game.sha256
+          fi
+
+      - name: Build the ReXGlue SDK for Linux (codegen tool)
+        working-directory: wwe13/wwe13-recomp
+        run: BUILD_JOBS=4 ./tools/setup.sh
+
+      - name: Generate the recompiled code
+        working-directory: wwe13/wwe13-recomp
+        run: ./tools/codegen.sh
+
+      - name: Check codegen output
         working-directory: wwe13/wwe13-recomp
         run: |
-          cmake -S launcher2 -B out/launcher2-win -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/../tools/rexglue/cmake/toolchains/win-amd64-xwin.cmake" \
-            -DXWIN_DIR="$XWIN_DIR" -DLLVM_BIN="$LLVM_BIN" \
-            -DXWIN_CPU_FLAGS="-march=ivybridge -mtune=ivybridge"
-          cmake --build out/launcher2-win --parallel
-          ls -l out/launcher2-win/wwe13-launcher.exe
+          python3 tools/check-manifest-integrity.py \
+            --manifest config/functions.toml \
+            --image out/tu-image.bin \
+            --generated generated \
+            --report-dir out/manifest-integrity
 
-      - uses: actions/upload-artifact@v4
+      - name: Build wwe13.exe (Windows x64, AVX1)
+        working-directory: wwe13/wwe13-recomp
+        run: BUILD_JOBS=4 ./tools/build-windows.sh
+
+      - name: Collect files
+        working-directory: wwe13/wwe13-recomp
+        run: |
+          mkdir -p dist/windows
+          cp out/build/win-amd64-cross/RelWithDebInfo/wwe13.exe dist/windows/
+          find out/build/win-amd64-cross/RelWithDebInfo ../tools/rexglue/out/install/win-amd64-cross \
+            -maxdepth 3 \( -name 'avcodec*.dll' -o -name 'avutil*.dll' -o -name 'swresample*.dll' \) \
+            -exec cp -n {} dist/windows/ \; 2>/dev/null || true
+          cp wwe13_config.toml dist/windows/ 2>/dev/null || true
+          ls -l dist/windows
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
         with:
-          name: wwe13-launcher-windows-avx1
-          path: wwe13/wwe13-recomp/out/launcher2-win/wwe13-launcher.exe
-          retention-days: 30
+          name: wwe13-windows-avx1
+          path: wwe13/wwe13-recomp/dist/windows
+          retention-days: 7
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            wwe13/wwe13-recomp/logs
+            wwe13/wwe13-recomp/out/manifest-integrity
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Build the Linux game
+        if: inputs.build_linux
+        working-directory: wwe13/wwe13-recomp
+        run: |
+          BUILD_JOBS=4 ./tools/build-linux.sh
+          mkdir -p dist/linux
+          cp out/build/linux-amd64-relwithdebinfo/RelWithDebInfo/wwe13 dist/linux/
+
+      - name: Upload Linux build
+        if: inputs.build_linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: wwe13-linux-avx1
+          path: wwe13/wwe13-recomp/dist/linux
+          retention-days: 7
